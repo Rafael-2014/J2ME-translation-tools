@@ -2,228 +2,90 @@
 """
 Star Wars: The Force Unleashed (THQ) — String Editor
 Web interface via Flask - Versão Mobile First
+Motor lógico: estrutura [ID:2BE][Total:2BE][Len:2BE][Texto UTF-8]
+Suporta strings de qualquer tamanho (pequenas e grandes).
 """
 
+import struct
 import copy
 import io
+import uuid
 from flask import Flask, render_template_string, request, jsonify, send_file
 
 app = Flask(__name__)
 
-# ── Parser / Rebuilder ─────────────────────────────────────────────────────────
+# ── Motor Lógico (parse + rebuild) ────────────────────────────────────────────
 
-def _decode_string(raw_bytes: bytes):
+def parse_en_file(data: bytes) -> dict:
     """
-    Detecta e decodifica os bytes da string.
-    Retorna (texto, encoding_detectado).
-    Prioridade: UTF-8 → Latin-1.
+    Lê o arquivo .en usando estrutura de 6 bytes por bloco:
+      [ID (2B BE)][Tamanho Total (2B BE)][Tamanho String (2B BE)][Texto UTF-8]
+    Suporta strings de qualquer tamanho (1 byte ate milhares).
     """
-    try:
-        return raw_bytes.decode('utf-8'), 'utf-8'
-    except UnicodeDecodeError:
-        return raw_bytes.decode('latin-1', errors='replace'), 'latin-1'
+    if not data.startswith(b'ST0'):
+        raise ValueError("Magic invalido - esperado 'ST0'")
 
+    count = struct.unpack('>H', data[3:5])[0]
+    pos   = 5
+    strings = []
 
-def _encode_string(text: str, encoding: str) -> bytes:
-    """
-    Codifica o texto respeitando o encoding original da entrada.
-    """
-    enc = encoding if encoding in ('utf-8', 'latin-1') else 'utf-8'
-    try:
-        return text.encode(enc, errors='replace')
-    except Exception:
-        return text.encode('utf-8', errors='replace')
+    for i in range(count):
+        if pos + 6 > len(data):
+            break
+        game_id   = struct.unpack('>H', data[pos:pos+2])[0]
+        total_len = struct.unpack('>H', data[pos+2:pos+4])[0]
+        str_len   = struct.unpack('>H', data[pos+4:pos+6])[0]
 
+        text_bytes = data[pos+6 : pos+6+str_len]
+        text = text_bytes.decode('utf-8', errors='replace')
 
-def _try_entry_3b(raw: bytes, offset: int):
-    """
-    Tenta ler entrada com header de 3 bytes:
-      [outer:1][0x00:1][inner:1][string:inner][flag:1][lo:1][hi:1]
-      Regra: outer == inner + 2, unk == 0x00
-    """
-    if offset + 5 >= len(raw):
-        return None
-    outer = raw[offset]
-    unk   = raw[offset + 1]
-    inner = raw[offset + 2]
-    if unk != 0x00 or inner == 0 or outer != inner + 2:
-        return None
-    str_end = offset + 3 + inner
-    if str_end + 2 >= len(raw):
-        return None
-    flag = raw[str_end]
-    if flag not in (0x00, 0x01):
-        return None
-    lo = raw[str_end + 1]
-    hi = raw[str_end + 2]
-    s, enc = _decode_string(raw[offset + 3:str_end])
-    return {
-        'offset':   offset,
-        'hdr_size': 3,
-        'inner':    inner,
-        'string':   s,
-        'encoding': enc,
-        'flag':     flag,
-        'lo':       lo,
-        'hi':       hi,
-        'value':    lo | (hi << 8),
-        'next_off': str_end + 3,
-    }
-
-
-def _try_entry_4b(raw: bytes, offset: int):
-    """
-    Tenta ler entrada com header de 4 bytes (uint16 big-endian):
-      [outer_hi:1][outer_lo:1][inner_hi:1][inner_lo:1][string:inner][flag:1][lo:1][hi:1]
-      Regra: outer == inner + 2
-    """
-    if offset + 6 >= len(raw):
-        return None
-    outer = (raw[offset] << 8) | raw[offset + 1]
-    inner = (raw[offset + 2] << 8) | raw[offset + 3]
-    if inner == 0 or outer != inner + 2:
-        return None
-    str_end = offset + 4 + inner
-    if str_end + 2 >= len(raw):
-        return None
-    flag = raw[str_end]
-    if flag not in (0x00, 0x01):
-        return None
-    lo = raw[str_end + 1]
-    hi = raw[str_end + 2]
-    s, enc = _decode_string(raw[offset + 4:str_end])
-    return {
-        'offset':   offset,
-        'hdr_size': 4,
-        'inner':    inner,
-        'string':   s,
-        'encoding': enc,
-        'flag':     flag,
-        'lo':       lo,
-        'hi':       hi,
-        'value':    lo | (hi << 8),
-        'next_off': str_end + 3,
-    }
-
-
-def parse_en_file(raw: bytes) -> dict:
-    """
-    Parse the .en binary e retorna representação estruturada completa.
-    Suporta:
-      - Header de 3 bytes (formato original Latin-1)
-      - Header de 4 bytes uint16 BE (formato UTF-8 / strings longas)
-      - Detecção automática de codificação (UTF-8 vs Latin-1) por entrada
-    """
-    if raw[:4] != b'ST0\x01':
-        raise ValueError("Magic inválido – esperado 'ST0\\x01'")
-
-    entries = []
-    offset  = 8   # pula os 8 bytes de header global
-
-    while offset < len(raw) - 5:
-        # Tenta header 3 bytes primeiro (mais comum)
-        e = _try_entry_3b(raw, offset)
-        if e is None:
-            # Tenta header 4 bytes (UTF-8 / strings longas)
-            e = _try_entry_4b(raw, offset)
-        if e:
-            entries.append(e)
-            offset = e['next_off']
-        else:
-            offset += 1
-
-    section1 = [e for e in entries if e['flag'] == 0]
-    section2 = [e for e in entries if e['flag'] == 1]
-
-    for i, e in enumerate(section1):
-        e['game_id'] = section1[i - 1]['value'] if i > 0 else 0
-
-    for e in section2:
-        e['seq'] = e['value']
-
-    all_sorted = sorted(entries, key=lambda e: e['offset'])
-    gaps = {}
-    for i in range(len(all_sorted) - 1):
-        curr     = all_sorted[i]
-        nxt      = all_sorted[i + 1]
-        curr_end = curr['next_off']
-        gap      = raw[curr_end:nxt['offset']]
-        if gap:
-            gaps[i] = gap
-
-    last     = all_sorted[-1]
-    trailing = raw[last['next_off']:]
-
-    # Detectar encoding global (majoritário)
-    enc_counts = {'utf-8': 0, 'latin-1': 0}
-    for e in entries:
-        enc_counts[e.get('encoding', 'utf-8')] += 1
-    global_encoding = 'utf-8' if enc_counts['utf-8'] >= enc_counts['latin-1'] else 'latin-1'
+        strings.append({
+            'id':      i,
+            'game_id': game_id,
+            'string':  text,
+            'len':     str_len,
+        })
+        pos += 6 + str_len
 
     return {
-        'header':          raw[:8],
-        'section1':        section1,
-        'section2':        section2,
-        '_sorted':         all_sorted,
-        '_gaps':           gaps,
-        '_trailing':       trailing,
-        'global_encoding': global_encoding,
+        'strings':         strings,
+        'count':           count,
+        'section1':        strings,   # alias para compatibilidade com a UI
+        'section2':        [],
+        'global_encoding': 'utf-8',
     }
 
 
 def rebuild_en_file(parsed: dict) -> bytes:
     """
-    Reconstrói o arquivo binário preservando:
-      - header global (8 bytes)
-      - hdr_size original de cada entrada (3 ou 4 bytes)
-      - encoding original de cada entrada (utf-8 ou latin-1)
-      - gaps entre entradas (bytes brutos)
-      - trailing bytes
+    Reconstrói o arquivo binario recalculando os tamanhos para UTF-8.
+    Estrutura: ST0 + [count:2BE] + N x ([game_id:2BE][total:2BE][len:2BE][texto])
     """
-    out = bytearray(parsed['header'])
+    strings_list = parsed['strings']
+    out = io.BytesIO()
+    out.write(b'ST0')
+    out.write(struct.pack('>H', len(strings_list)))
 
-    all_sorted      = sorted(parsed['section1'] + parsed['section2'],
-                             key=lambda e: e['offset'])
-    entry_by_offset = {e['offset']: e for e in all_sorted}
-    orig_sorted     = parsed['_sorted']
-    gaps            = parsed['_gaps']
-    global_enc      = parsed.get('global_encoding', 'utf-8')
+    for item in strings_list:
+        text_bytes  = item['string'].replace('\r\n', '\n').encode('utf-8')
+        new_str_len = len(text_bytes)
+        new_total   = new_str_len + 2
+        out.write(struct.pack('>H', item['game_id']))
+        out.write(struct.pack('>H', new_total))
+        out.write(struct.pack('>H', new_str_len))
+        out.write(text_bytes)
 
-    for i, orig_e in enumerate(orig_sorted):
-        e        = entry_by_offset.get(orig_e['offset'], orig_e)
-        hdr_size = orig_e.get('hdr_size', 3)
-        enc      = orig_e.get('encoding', global_enc)
-
-        s_enc = _encode_string(e['string'], enc)
-        inner = len(s_enc)
-        outer = inner + 2
-
-        if hdr_size == 4:
-            # Header uint16 big-endian (2B outer + 2B inner)
-            out += bytes([(outer >> 8) & 0xFF, outer & 0xFF,
-                          (inner >> 8) & 0xFF, inner & 0xFF])
-        else:
-            # Header padrão 3 bytes
-            out += bytes([outer & 0xFF, 0x00, inner & 0xFF])
-
-        out += s_enc
-        out += bytes([e['flag'], e['lo'], e['hi']])
-        if i in gaps:
-            out += gaps[i]
-
-    out += parsed['_trailing']
-    return bytes(out)
+    return out.getvalue()
 
 
-import uuid
+# ── Estado do servidor ────────────────────────────────────────────────────────
+
 state = {
     'parsed':     None,
     'filename':   'en',
-    'session_id': str(uuid.uuid4()),  # novo ID a cada execução do servidor
+    'session_id': str(uuid.uuid4()),
 }
 
-
-# ── HTML Mobile First ──────────────────────────────────────────────────────────
 
 HTML = r"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -1201,38 +1063,25 @@ def session_info():
 def upload():
     if 'file' not in request.files:
         return jsonify({'error': 'Nenhum arquivo enviado'}), 400
-    f = request.files['file']
+    f   = request.files['file']
     raw = f.read()
     try:
         parsed = parse_en_file(raw)
     except Exception as ex:
         return jsonify({'error': str(ex)}), 400
 
-    state['parsed'] = parsed
+    state['parsed']   = parsed
     state['filename'] = f.filename or 'en'
 
-    def fmt_entry(e, extra: dict):
-        d = {
-            'offset':   e['offset'],
-            'hdr_size': e.get('hdr_size', 3),
-            'inner':    e['inner'],
-            'string':   e['string'],
-            'encoding': e.get('encoding', 'utf-8'),
-            'flag':     e['flag'],
-            'lo':       e['lo'],
-            'hi':       e['hi'],
-            'value':    e['value'],
-        }
-        d.update(extra)
-        return d
-
-    s1 = [fmt_entry(e, {'game_id': e.get('game_id', 0)}) for e in parsed['section1']]
-    s2 = [fmt_entry(e, {'seq': e.get('seq', e['value'])}) for e in parsed['section2']]
+    # Serializar strings para o JS
+    s1 = [{'id': e['id'], 'game_id': e['game_id'], 'string': e['string'],
+            'len': e['len'], 'hdr_size': 6, 'encoding': 'utf-8'}
+          for e in parsed['strings']]
 
     return jsonify({
         'section1':        s1,
-        'section2':        s2,
-        'global_encoding': parsed.get('global_encoding', 'utf-8'),
+        'section2':        [],
+        'global_encoding': 'utf-8',
         'session_id':      state['session_id'],
     })
 
@@ -1247,13 +1096,10 @@ def save():
 
     parsed = copy.deepcopy(state['parsed'])
 
+    # Aplicar edicoes da section1 (unica secao no novo motor)
     for i, e in enumerate(body.get('section1', [])):
-        if i < len(parsed['section1']):
-            parsed['section1'][i]['string'] = e['string']
-
-    for i, e in enumerate(body.get('section2', [])):
-        if i < len(parsed['section2']):
-            parsed['section2'][i]['string'] = e['string']
+        if i < len(parsed['strings']):
+            parsed['strings'][i]['string'] = e['string']
 
     try:
         out_bytes = rebuild_en_file(parsed)
